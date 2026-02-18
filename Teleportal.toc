@@ -1,0 +1,8 @@
+## Interface: 11508, 20505, 50503
+## Title: Teleportal
+## Author: Codermik
+## Version: 1.0.180226
+## Notes: Provides a handy button which opens both Mage teleports and portals instead of cluttering your game interface.
+## SavedVariables: TeleportalDB
+
+Teleportal.lua
