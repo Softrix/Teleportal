@@ -247,11 +247,12 @@ end
 local PANEL_ABOVE_BUTTON_OFFSET = 28
 
 local function UpdateRuneHeader()
-    if not teleportRuneCountText or not portalRuneCountText then return end
     local teleCount = GetItemCount(RUNE_TELEPORT_ITEM_ID) or 0
     local portalCount = GetItemCount(RUNE_PORTAL_ITEM_ID) or 0
-    teleportRuneCountText:SetText(tostring(teleCount))
-    portalRuneCountText:SetText(tostring(portalCount))
+    if teleportRuneCountText and portalRuneCountText then
+        teleportRuneCountText:SetText(tostring(teleCount))
+        portalRuneCountText:SetText(tostring(portalCount))
+    end
     if teleportRuneIconRef then
         local tex = GetItemIcon(RUNE_TELEPORT_ITEM_ID)
         if tex then teleportRuneIconRef:SetTexture(tex) end
@@ -260,10 +261,14 @@ local function UpdateRuneHeader()
         local tex = GetItemIcon(RUNE_PORTAL_ITEM_ID)
         if tex then portalRuneIconRef:SetTexture(tex) end
     end
+    if toggleButton and toggleButton.runeCountText then
+        toggleButton.runeCountText:SetText(teleCount .. " / " .. portalCount)
+    end
 end
 
 local function AnimatePanelOpen()
     if not mainPanel or not toggleButton then return end
+    if InCombatLockdown() then return end
     StopPanelAnimator()
     -- If ActionButtonUseKeyDown is 1, set to 0 so click works; remember to restore when we close
     if GetCVar("ActionButtonUseKeyDown") == "1" then
@@ -290,6 +295,10 @@ end
 
 local function AnimatePanelClose()
     if not mainPanel or not mainPanel:IsShown() or not toggleButton then return end
+    if InCombatLockdown() then
+        pendingPanelHide = true
+        return
+    end
     StopPanelAnimator()
     -- Zoom back down: panel bottom stays 30px above button
     mainPanel:ClearAllPoints()
@@ -408,7 +417,7 @@ local function CreateToggleButton()
     local fallbackIcon = "Interface/Icons/Spell_Arcane_Teleport"
 
     local btn = CreateFrame("Button", "TeleportalToggleButton", UIParent)
-    btn:SetSize(36, 36)
+    btn:SetSize(61, 36)
     -- Restore saved position (WoW may use TOPLEFT etc. after drag, so save full anchor)
     local db = TeleportalDB
     if type(db.buttonPoint) == "string" and type(db.buttonX) == "number" and type(db.buttonY) == "number" then
@@ -476,6 +485,15 @@ local function CreateToggleButton()
     tex:SetAllPoints(btn)
     tex:SetTexCoord(0.08, 0.92, 0.08, 0.92)
     tex:SetTexture(iconPath)
+    tex:SetAlpha(0.55)
+
+    -- Rune counter overlay (teleport runes / portal runes) - same style as frame counters
+    local runeCountText = btn:CreateFontString(nil, "OVERLAY", "NumberFontNormal")
+    runeCountText:SetPoint("CENTER", btn, "CENTER", 0, 0)
+    runeCountText:SetJustifyH("CENTER")
+    runeCountText:SetJustifyV("MIDDLE")
+    runeCountText:SetText("0/0")
+    btn.runeCountText = runeCountText
 
     btn:SetScript("OnShow", function()
         if not tex:GetTexture() or tex:GetTexture() == "" then
