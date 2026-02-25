@@ -16,11 +16,21 @@ end
 local teleportSpells = {}
 local portalSpells = {}
 
+-- Rune reagent item IDs (mage)
+local RUNE_TELEPORT_ITEM_ID = 17031
+local RUNE_PORTAL_ITEM_ID = 17032
+
 -- UI references
 local toggleButton
 local mainPanel
 local teleportContent
 local portalContent
+local teleportRuneHeader
+local portalRuneHeader
+local teleportRuneIconRef
+local portalRuneIconRef
+local teleportRuneCountText
+local portalRuneCountText
 local teleportButtons = {}
 local portalButtons = {}
 local teleportButtonPool = {}
@@ -35,9 +45,9 @@ local COLUMN_GAP = 1
 local PANEL_TOP_INSET = 1
 local PANEL_BOTTOM_INSET = 1
 
+-- Content height = one header row + N spell rows
 local function GetContentHeightForButtonCount(count)
-    if count == 0 then return 0 end
-    return count * (BUTTON_SIZE + BUTTON_PADDING) - BUTTON_PADDING
+    return (1 + count) * (BUTTON_SIZE + BUTTON_PADDING) - BUTTON_PADDING
 end
 
 local function UpdatePanelHeight()
@@ -116,7 +126,8 @@ local function GetOrCreateSpellButton(parent, pool, spellInfo, index)
     btn.spellName = spellInfo.name
     btn:SetParent(parent)
     btn:ClearAllPoints()
-    btn:SetPoint("TOPLEFT", parent, "TOPLEFT", 0, -(index - 1) * (BUTTON_SIZE + BUTTON_PADDING))
+    -- First spell row is below header: index 1 at Y = -(BUTTON_SIZE + BUTTON_PADDING)
+    btn:SetPoint("TOPLEFT", parent, "TOPLEFT", 0, -index * (BUTTON_SIZE + BUTTON_PADDING))
     btn:SetAttribute("type", "spell")
     btn:SetAttribute("spell", spellInfo.name)
     local tex = GetSpellTexture(spellInfo.spellID) or GetSpellTexture(spellInfo.name)
@@ -127,7 +138,14 @@ local function GetOrCreateSpellButton(parent, pool, spellInfo, index)
     return btn
 end
 
+local pendingSpellRebuild = false
+local pendingPanelHide = false
+
 local function RebuildSpellLists()
+    if InCombatLockdown() then
+        pendingSpellRebuild = true
+        return
+    end
     -- Return current buttons to pool
     for _, b in ipairs(teleportButtons) do
         b:Hide()
@@ -198,8 +216,12 @@ local function RunPanelAnimator()
                 SetCVar("ActionButtonUseKeyDown", "1")
                 actionButtonUseKeyDownRestore = false
             end
-            mainPanel:Hide()
-            mainPanel:SetScale(1)
+            if not InCombatLockdown() then
+                mainPanel:Hide()
+                mainPanel:SetScale(1)
+            else
+                pendingPanelHide = true
+            end
         end
         StopPanelAnimator()
         return
@@ -224,6 +246,22 @@ end
 -- Panel bottom stays this many pixels above the toggle button's top (button is 36px tall)
 local PANEL_ABOVE_BUTTON_OFFSET = 28
 
+local function UpdateRuneHeader()
+    if not teleportRuneCountText or not portalRuneCountText then return end
+    local teleCount = GetItemCount(RUNE_TELEPORT_ITEM_ID) or 0
+    local portalCount = GetItemCount(RUNE_PORTAL_ITEM_ID) or 0
+    teleportRuneCountText:SetText(tostring(teleCount))
+    portalRuneCountText:SetText(tostring(portalCount))
+    if teleportRuneIconRef then
+        local tex = GetItemIcon(RUNE_TELEPORT_ITEM_ID)
+        if tex then teleportRuneIconRef:SetTexture(tex) end
+    end
+    if portalRuneIconRef then
+        local tex = GetItemIcon(RUNE_PORTAL_ITEM_ID)
+        if tex then portalRuneIconRef:SetTexture(tex) end
+    end
+end
+
 local function AnimatePanelOpen()
     if not mainPanel or not toggleButton then return end
     StopPanelAnimator()
@@ -240,6 +278,7 @@ local function AnimatePanelOpen()
     mainPanel:SetScale(ANIM_START_SCALE)
     mainPanel:Show()
     ScanAndRebuild()
+    UpdateRuneHeader()
     animatorDirection = "in"
     animatorStartTime = GetTime()
     animatorRunning = true
@@ -301,15 +340,61 @@ local function CreateMainPanel()
     teleportChild:SetFrameLevel(panel:GetFrameLevel() + 10)
     teleportChild:EnableMouse(false)
 
+    -- Left column: rune of teleportation header (icon + count)
+    local teleportRuneFrame = CreateFrame("Frame", nil, teleportChild)
+    teleportRuneFrame:SetSize(BUTTON_SIZE, BUTTON_SIZE)
+    teleportRuneFrame:SetPoint("TOPLEFT", teleportChild, "TOPLEFT", 0, 0)
+    teleportRuneFrame:EnableMouse(true)
+    teleportRuneFrame:SetScript("OnEnter", function(self)
+        GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+        GameTooltip:SetText("Rune of Teleportation currently\nin your bags.")
+        GameTooltip:Show()
+    end)
+    teleportRuneFrame:SetScript("OnLeave", function() GameTooltip:Hide() end)
+    local teleportRuneIcon = teleportRuneFrame:CreateTexture(nil, "ARTWORK")
+    teleportRuneIcon:SetAllPoints(teleportRuneFrame)
+    teleportRuneIcon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
+    teleportRuneIcon:SetAlpha(0.5)
+    local teleportRuneCount = teleportRuneFrame:CreateFontString(nil, "OVERLAY", "NumberFontNormal")
+    teleportRuneCount:SetPoint("CENTER", teleportRuneFrame, "CENTER", 0, 0)
+    teleportRuneCount:SetJustifyH("CENTER")
+    teleportRuneCount:SetJustifyV("MIDDLE")
+
     local portalChild = CreateFrame("Frame", nil, panel)
     portalChild:SetSize(COLUMN_WIDTH, 0)
     portalChild:SetPoint("TOPLEFT", portalX, contentY)
     portalChild:SetFrameLevel(panel:GetFrameLevel() + 10)
     portalChild:EnableMouse(false)
 
+    -- Right column: rune of portals header (icon + count)
+    local portalRuneFrame = CreateFrame("Frame", nil, portalChild)
+    portalRuneFrame:SetSize(BUTTON_SIZE, BUTTON_SIZE)
+    portalRuneFrame:SetPoint("TOPLEFT", portalChild, "TOPLEFT", 0, 0)
+    portalRuneFrame:EnableMouse(true)
+    portalRuneFrame:SetScript("OnEnter", function(self)
+        GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+        GameTooltip:SetText("Rune of Portals currently\nin your bags.")
+        GameTooltip:Show()
+    end)
+    portalRuneFrame:SetScript("OnLeave", function() GameTooltip:Hide() end)
+    local portalRuneIcon = portalRuneFrame:CreateTexture(nil, "ARTWORK")
+    portalRuneIcon:SetAllPoints(portalRuneFrame)
+    portalRuneIcon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
+    portalRuneIcon:SetAlpha(0.5)
+    local portalRuneCount = portalRuneFrame:CreateFontString(nil, "OVERLAY", "NumberFontNormal")
+    portalRuneCount:SetPoint("CENTER", portalRuneFrame, "CENTER", 0, 0)
+    portalRuneCount:SetJustifyH("CENTER")
+    portalRuneCount:SetJustifyV("MIDDLE")
+
     mainPanel = panel
     teleportContent = teleportChild
     portalContent = portalChild
+    teleportRuneHeader = teleportRuneFrame
+    portalRuneHeader = portalRuneFrame
+    teleportRuneIconRef = teleportRuneIcon
+    portalRuneIconRef = portalRuneIcon
+    teleportRuneCountText = teleportRuneCount
+    portalRuneCountText = portalRuneCount
 
     return panel
 end
@@ -351,6 +436,16 @@ local function CreateToggleButton()
         else
             AnimatePanelOpen()
         end
+    end)
+
+    -- Tooltip for main Teleportal button
+    btn:SetScript("OnEnter", function(self)
+        GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+        GameTooltip:SetText("Teleportal r1.0.250226\nby Codermik.")
+        GameTooltip:Show()
+    end)
+    btn:SetScript("OnLeave", function()
+        GameTooltip:Hide()
     end)
 
     -- Small button border around the icon
@@ -420,16 +515,31 @@ local function OnEvent(_, event, arg1)
             CreateToggleButton()
             ScanSpellbook()
             RebuildSpellLists()
+            UpdateRuneHeader()
             local cyan = "\124cFF00FFFF"
             local yellow = "\124cFFFFFF00"
             local r = "\124r"
             DEFAULT_CHAT_FRAME:AddMessage(cyan .. "Teleportal" .. r .. " : loaded! - Created by Codermik, join Discord for support at: " .. yellow .. "https://discord.gg/R6EkZ94TKK" .. r)
             frame:RegisterEvent("SPELLS_CHANGED")
+            frame:RegisterEvent("BAG_UPDATE_DELAYED")
+            frame:RegisterEvent("PLAYER_REGEN_ENABLED")
         else
             ScanAndRebuild()
         end
     elseif event == "SPELLS_CHANGED" then
         ScanAndRebuild()
+    elseif event == "BAG_UPDATE_DELAYED" then
+        UpdateRuneHeader()
+    elseif event == "PLAYER_REGEN_ENABLED" then
+        if pendingPanelHide and mainPanel then
+            pendingPanelHide = false
+            mainPanel:Hide()
+            mainPanel:SetScale(1)
+        end
+        if pendingSpellRebuild then
+            pendingSpellRebuild = false
+            ScanAndRebuild()
+        end
     end
 end
 
