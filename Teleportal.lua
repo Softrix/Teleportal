@@ -5,7 +5,9 @@
 ]]
 
 local ADDON_NAME = "Teleportal"
+local ADDON_VERSION = "1.0.240526"
 local BOOKTYPE = (BOOKTYPE_SPELL ~= nil) and BOOKTYPE_SPELL or "spell"
+local isRetail = (WOW_PROJECT_MAINLINE and WOW_PROJECT_ID == WOW_PROJECT_MAINLINE)
 
 -- Saved position for toggle button (persists across sessions)
 if not TeleportalDB then
@@ -35,6 +37,13 @@ local teleportButtons = {}
 local portalButtons = {}
 local teleportButtonPool = {}
 local portalButtonPool = {}
+local teleportBlankPool = {}
+local portalBlankPool = {}
+local teleportPlaceholders = {}
+local portalPlaceholders = {}
+
+-- Spell IDs that should auto-close the panel when cast completes (teleports + portals)
+local closeOnCastSpellIDs = {}
 
 local BUTTON_SIZE = 32
 local BUTTON_PADDING = 1
@@ -45,15 +54,17 @@ local COLUMN_GAP = 1
 local PANEL_TOP_INSET = 1
 local PANEL_BOTTOM_INSET = 1
 
--- Content height = one header row + N spell rows
+-- Content height = one header row + N spell rows (Classic); N spell rows only (Retail)
 local function GetContentHeightForButtonCount(count)
-    return (1 + count) * (BUTTON_SIZE + BUTTON_PADDING) - BUTTON_PADDING
+    local rows = isRetail and count or (1 + count)
+    return math.max(0, rows * (BUTTON_SIZE + BUTTON_PADDING) - BUTTON_PADDING)
 end
 
 local function UpdatePanelHeight()
     if not mainPanel or not teleportContent then return end
-    local maxCount = math.max(#teleportSpells, #portalSpells)
-    local contentHeight = GetContentHeightForButtonCount(maxCount)
+    -- One row per teleport (portal column shows matching portal or blank)
+    local rowCount = #teleportSpells
+    local contentHeight = GetContentHeightForButtonCount(rowCount)
     local panelHeight = PANEL_TOP_INSET + contentHeight + PANEL_BOTTOM_INSET
     mainPanel:SetHeight(panelHeight)
     teleportContent:SetHeight(contentHeight)
@@ -68,6 +79,55 @@ local function ScanSpellbook()
     teleportSpells = {}
     portalSpells = {}
 
+    if isRetail and C_SpellBook and C_SpellBook.GetSpellBookItemInfo then
+        -- Retail (11.0+): spellbook uses C_SpellBook; Teleport/Portal may be under Flyout items
+        local spellBank = Enum and Enum.SpellBookSpellBank and Enum.SpellBookSpellBank.Player or 0
+        local spellType = Enum and Enum.SpellBookItemType and Enum.SpellBookItemType.Spell or 1
+        local flyoutType = Enum and Enum.SpellBookItemType and Enum.SpellBookItemType.Flyout or 4
+        local numLines = C_SpellBook.GetNumSpellBookSkillLines and C_SpellBook.GetNumSpellBookSkillLines() or 0
+        for lineIndex = 1, numLines do
+            local skillLineInfo = C_SpellBook.GetSpellBookSkillLineInfo(lineIndex)
+            if skillLineInfo then
+                local offset, numSlots = skillLineInfo.itemIndexOffset or 0, skillLineInfo.numSpellBookItems or 0
+                for j = offset + 1, offset + numSlots do
+                    local info = C_SpellBook.GetSpellBookItemInfo(j, spellBank)
+                    if not info then break end
+                    if info.itemType == spellType and info.name and not info.isPassive then
+                        local spellID = info.spellID or info.actionID
+                        if spellID then
+                            if info.name:match("^Teleport") then
+                                tinsert(teleportSpells, { name = info.name, spellID = spellID })
+                            elseif info.name:match("^Portal") then
+                                tinsert(portalSpells, { name = info.name, spellID = spellID })
+                            end
+                        end
+                    elseif info.itemType == flyoutType and info.actionID and GetFlyoutInfo and GetFlyoutSlotInfo then
+                        -- Teleport/Portal are often in a flyout; expand it and add matching spells
+                        local flyoutID = info.actionID
+                        local _, _, flyoutNumSlots = GetFlyoutInfo(flyoutID)
+                        if flyoutNumSlots and flyoutNumSlots > 0 then
+                            for slot = 1, flyoutNumSlots do
+                                local slotSpellID, overrideSpellID, isKnown, spellName = GetFlyoutSlotInfo(flyoutID, slot)
+                                if isKnown and spellName and (slotSpellID or overrideSpellID) then
+                                    local id = overrideSpellID or slotSpellID
+                                    if C_Spell and C_Spell.IsSpellPassive and C_Spell.IsSpellPassive(id) then
+                                        -- skip passive (e.g. Teleportation Nexus)
+                                    elseif spellName:match("^Teleport") then
+                                        tinsert(teleportSpells, { name = spellName, spellID = id })
+                                    elseif spellName:match("^Portal") then
+                                        tinsert(portalSpells, { name = spellName, spellID = id })
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        return
+    end
+
+    -- Classic: use GetSpellBookItemName / GetSpellBookItemInfo
     local i = 1
     while true do
         local name = GetSpellBookItemName(i, BOOKTYPE)
@@ -77,10 +137,13 @@ local function ScanSpellbook()
 
         local skillType, spellID = GetSpellBookItemInfo(i, BOOKTYPE)
         if skillType == "SPELL" and spellID then
-            if name:match("^Teleport") then
-                tinsert(teleportSpells, { name = name, spellID = spellID })
-            elseif name:match("^Portal") then
-                tinsert(portalSpells, { name = name, spellID = spellID })
+            local passive = (IsPassiveSpell and IsPassiveSpell(i, BOOKTYPE))
+            if not passive then
+                if name:match("^Teleport") then
+                    tinsert(teleportSpells, { name = name, spellID = spellID })
+                elseif name:match("^Portal") then
+                    tinsert(portalSpells, { name = name, spellID = spellID })
+                end
             end
         end
 
@@ -91,6 +154,13 @@ end
 -- ---------------------------------------------------------------------------
 -- Rebuild spell buttons in both columns
 -- ---------------------------------------------------------------------------
+
+-- Extract destination from "Teleport: X" or "Portal: X" for matching pairs
+local function GetDestination(spellName)
+    if not spellName then return nil end
+    local dest = spellName:match("^Teleport: (.+)") or spellName:match("^Portal: (.+)")
+    return dest
+end
 
 local function GetOrCreateSpellButton(parent, pool, spellInfo, index)
     local btn = tremove(pool)
@@ -126,16 +196,38 @@ local function GetOrCreateSpellButton(parent, pool, spellInfo, index)
     btn.spellName = spellInfo.name
     btn:SetParent(parent)
     btn:ClearAllPoints()
-    -- First spell row is below header: index 1 at Y = -(BUTTON_SIZE + BUTTON_PADDING)
-    btn:SetPoint("TOPLEFT", parent, "TOPLEFT", 0, -index * (BUTTON_SIZE + BUTTON_PADDING))
+    -- Classic: first spell below header (index 1 at -1 row). Retail: first spell at top (index 1 at 0).
+    local rowOffset = isRetail and (index - 1) or index
+    btn:SetPoint("TOPLEFT", parent, "TOPLEFT", 0, -rowOffset * (BUTTON_SIZE + BUTTON_PADDING))
     btn:SetAttribute("type", "spell")
     btn:SetAttribute("spell", spellInfo.name)
-    local tex = GetSpellTexture(spellInfo.spellID) or GetSpellTexture(spellInfo.name)
+    local tex
+    if isRetail and C_Spell and C_Spell.GetSpellTexture then
+        tex = C_Spell.GetSpellTexture(spellInfo.spellID)
+    else
+        tex = GetSpellTexture(spellInfo.spellID) or GetSpellTexture(spellInfo.name)
+    end
     if tex then
         btn.icon:SetTexture(tex)
     end
     btn:Show()
     return btn
+end
+
+-- Blank placeholder to keep column rows aligned when one side has no spell at that row
+local function GetOrCreateBlankPlaceholder(parent, pool, index)
+    local ph = tremove(pool)
+    if not ph then
+        ph = CreateFrame("Frame", nil, parent)
+        ph:SetHeight(BUTTON_SIZE)
+        ph:SetWidth(BUTTON_SIZE)
+    end
+    ph:SetParent(parent)
+    ph:ClearAllPoints()
+    local rowOffset = isRetail and (index - 1) or index
+    ph:SetPoint("TOPLEFT", parent, "TOPLEFT", 0, -rowOffset * (BUTTON_SIZE + BUTTON_PADDING))
+    ph:Show()
+    return ph
 end
 
 local pendingSpellRebuild = false
@@ -146,30 +238,71 @@ local function RebuildSpellLists()
         pendingSpellRebuild = true
         return
     end
-    -- Return current buttons to pool
+
+    -- Index portals by destination so we can match "Teleport: X" with "Portal: X"
+    local portalByDestination = {}
+    for _, spellInfo in ipairs(portalSpells) do
+        local dest = GetDestination(spellInfo.name)
+        if dest then
+            portalByDestination[dest] = spellInfo
+        end
+    end
+
+    -- One row per teleport; each row shows (teleport, matching portal or blank)
+    local rowCount = #teleportSpells
+
+    -- Return current buttons to spell pools and placeholders to blank pools
     for _, b in ipairs(teleportButtons) do
         b:Hide()
         b:ClearAllPoints()
         tinsert(teleportButtonPool, b)
     end
     teleportButtons = {}
+    for _, ph in ipairs(teleportPlaceholders) do
+        ph:Hide()
+        ph:ClearAllPoints()
+        tinsert(teleportBlankPool, ph)
+    end
+    teleportPlaceholders = {}
     for _, b in ipairs(portalButtons) do
         b:Hide()
         b:ClearAllPoints()
         tinsert(portalButtonPool, b)
     end
     portalButtons = {}
+    for _, ph in ipairs(portalPlaceholders) do
+        ph:Hide()
+        ph:ClearAllPoints()
+        tinsert(portalBlankPool, ph)
+    end
+    portalPlaceholders = {}
 
-    -- Teleports column
-    for idx, spellInfo in ipairs(teleportSpells) do
-        local btn = GetOrCreateSpellButton(teleportContent, teleportButtonPool, spellInfo, idx)
+    for row = 1, rowCount do
+        local teleInfo = teleportSpells[row]
+        local dest = GetDestination(teleInfo.name)
+        local portalInfo = dest and portalByDestination[dest] or nil
+
+        -- Left column: always the teleport for this row
+        local btn = GetOrCreateSpellButton(teleportContent, teleportButtonPool, teleInfo, row)
         tinsert(teleportButtons, btn)
+
+        -- Right column: matching portal if one exists for this destination, else blank
+        if portalInfo then
+            local pbtn = GetOrCreateSpellButton(portalContent, portalButtonPool, portalInfo, row)
+            tinsert(portalButtons, pbtn)
+        else
+            local ph = GetOrCreateBlankPlaceholder(portalContent, portalBlankPool, row)
+            tinsert(portalPlaceholders, ph)
+        end
     end
 
-    -- Portals column
-    for idx, spellInfo in ipairs(portalSpells) do
-        local btn = GetOrCreateSpellButton(portalContent, portalButtonPool, spellInfo, idx)
-        tinsert(portalButtons, btn)
+    -- Build set of spell IDs that trigger auto-close when cast finishes
+    closeOnCastSpellIDs = {}
+    for _, info in ipairs(teleportSpells) do
+        if info.spellID then closeOnCastSpellIDs[info.spellID] = true end
+    end
+    for _, info in ipairs(portalSpells) do
+        if info.spellID then closeOnCastSpellIDs[info.spellID] = true end
     end
 
     UpdatePanelHeight()
@@ -243,10 +376,13 @@ local function RunPanelAnimator()
     mainPanel:SetScale(scale)
 end
 
--- Panel bottom stays this many pixels above the toggle button's top (button is 36px tall)
+-- Panel bottom stays this many pixels above the toggle button's top (from toggle center: center + 28)
 local PANEL_ABOVE_BUTTON_OFFSET = 28
+-- Vertical offset from toggle BOTTOM to panel BOTTOM so panel sits above buttons
+local PANEL_BOTTOM_OFFSET = (BUTTON_SIZE / 2) + PANEL_ABOVE_BUTTON_OFFSET
 
 local function UpdateRuneHeader()
+    if isRetail then return end
     local teleCount = GetItemCount(RUNE_TELEPORT_ITEM_ID) or 0
     local portalCount = GetItemCount(RUNE_PORTAL_ITEM_ID) or 0
     if teleportRuneCountText and portalRuneCountText then
@@ -277,9 +413,8 @@ local function AnimatePanelOpen()
     else
         actionButtonUseKeyDownRestore = false
     end
-    -- Zoom up from above the button: panel bottom stays 30px above button so button is never covered
     mainPanel:ClearAllPoints()
-    mainPanel:SetPoint("BOTTOM", toggleButton, "CENTER", 0, PANEL_ABOVE_BUTTON_OFFSET)
+    mainPanel:SetPoint("BOTTOM", toggleButton, "BOTTOM", 0, PANEL_BOTTOM_OFFSET)
     mainPanel:SetScale(ANIM_START_SCALE)
     mainPanel:Show()
     ScanAndRebuild()
@@ -300,9 +435,8 @@ local function AnimatePanelClose()
         return
     end
     StopPanelAnimator()
-    -- Zoom back down: panel bottom stays 30px above button
     mainPanel:ClearAllPoints()
-    mainPanel:SetPoint("BOTTOM", toggleButton, "CENTER", 0, PANEL_ABOVE_BUTTON_OFFSET)
+    mainPanel:SetPoint("BOTTOM", toggleButton, "BOTTOM", 0, PANEL_BOTTOM_OFFSET)
     animatorDirection = "out"
     animatorStartTime = GetTime()
     animatorRunning = true
@@ -310,6 +444,15 @@ local function AnimatePanelClose()
         animatorFrame = CreateFrame("Frame")
     end
     animatorFrame:SetScript("OnUpdate", RunPanelAnimator)
+end
+
+local function ToggleTeleportalPanel()
+    if not mainPanel then return end
+    if mainPanel:IsShown() then
+        AnimatePanelClose()
+    else
+        AnimatePanelOpen()
+    end
 end
 
 local function CreateMainPanel()
@@ -349,25 +492,30 @@ local function CreateMainPanel()
     teleportChild:SetFrameLevel(panel:GetFrameLevel() + 10)
     teleportChild:EnableMouse(false)
 
-    -- Left column: rune of teleportation header (icon + count)
-    local teleportRuneFrame = CreateFrame("Frame", nil, teleportChild)
-    teleportRuneFrame:SetSize(BUTTON_SIZE, BUTTON_SIZE)
-    teleportRuneFrame:SetPoint("TOPLEFT", teleportChild, "TOPLEFT", 0, 0)
-    teleportRuneFrame:EnableMouse(true)
-    teleportRuneFrame:SetScript("OnEnter", function(self)
-        GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
-        GameTooltip:SetText("Rune of Teleportation currently\nin your bags.")
-        GameTooltip:Show()
-    end)
-    teleportRuneFrame:SetScript("OnLeave", function() GameTooltip:Hide() end)
-    local teleportRuneIcon = teleportRuneFrame:CreateTexture(nil, "ARTWORK")
-    teleportRuneIcon:SetAllPoints(teleportRuneFrame)
-    teleportRuneIcon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
-    teleportRuneIcon:SetAlpha(0.5)
-    local teleportRuneCount = teleportRuneFrame:CreateFontString(nil, "OVERLAY", "NumberFontNormal")
-    teleportRuneCount:SetPoint("CENTER", teleportRuneFrame, "CENTER", 0, 0)
-    teleportRuneCount:SetJustifyH("CENTER")
-    teleportRuneCount:SetJustifyV("MIDDLE")
+    if not isRetail then
+        -- Left column: rune of teleportation header (icon + count)
+        local teleportRuneFrame = CreateFrame("Frame", nil, teleportChild)
+        teleportRuneFrame:SetSize(BUTTON_SIZE, BUTTON_SIZE)
+        teleportRuneFrame:SetPoint("TOPLEFT", teleportChild, "TOPLEFT", 0, 0)
+        teleportRuneFrame:EnableMouse(true)
+        teleportRuneFrame:SetScript("OnEnter", function(self)
+            GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+            GameTooltip:SetText((TeleportalLocale and TeleportalLocale("RUNE_OF_TELEPORTATION_TOOLTIP")) or "Rune of Teleportation currently\nin your bags.")
+            GameTooltip:Show()
+        end)
+        teleportRuneFrame:SetScript("OnLeave", function() GameTooltip:Hide() end)
+        local teleportRuneIcon = teleportRuneFrame:CreateTexture(nil, "ARTWORK")
+        teleportRuneIcon:SetAllPoints(teleportRuneFrame)
+        teleportRuneIcon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
+        teleportRuneIcon:SetAlpha(0.5)
+        local teleportRuneCount = teleportRuneFrame:CreateFontString(nil, "OVERLAY", "NumberFontNormal")
+        teleportRuneCount:SetPoint("CENTER", teleportRuneFrame, "CENTER", 0, 0)
+        teleportRuneCount:SetJustifyH("CENTER")
+        teleportRuneCount:SetJustifyV("MIDDLE")
+        teleportRuneHeader = teleportRuneFrame
+        teleportRuneIconRef = teleportRuneIcon
+        teleportRuneCountText = teleportRuneCount
+    end
 
     local portalChild = CreateFrame("Frame", nil, panel)
     portalChild:SetSize(COLUMN_WIDTH, 0)
@@ -375,35 +523,34 @@ local function CreateMainPanel()
     portalChild:SetFrameLevel(panel:GetFrameLevel() + 10)
     portalChild:EnableMouse(false)
 
-    -- Right column: rune of portals header (icon + count)
-    local portalRuneFrame = CreateFrame("Frame", nil, portalChild)
-    portalRuneFrame:SetSize(BUTTON_SIZE, BUTTON_SIZE)
-    portalRuneFrame:SetPoint("TOPLEFT", portalChild, "TOPLEFT", 0, 0)
-    portalRuneFrame:EnableMouse(true)
-    portalRuneFrame:SetScript("OnEnter", function(self)
-        GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
-        GameTooltip:SetText("Rune of Portals currently\nin your bags.")
-        GameTooltip:Show()
-    end)
-    portalRuneFrame:SetScript("OnLeave", function() GameTooltip:Hide() end)
-    local portalRuneIcon = portalRuneFrame:CreateTexture(nil, "ARTWORK")
-    portalRuneIcon:SetAllPoints(portalRuneFrame)
-    portalRuneIcon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
-    portalRuneIcon:SetAlpha(0.5)
-    local portalRuneCount = portalRuneFrame:CreateFontString(nil, "OVERLAY", "NumberFontNormal")
-    portalRuneCount:SetPoint("CENTER", portalRuneFrame, "CENTER", 0, 0)
-    portalRuneCount:SetJustifyH("CENTER")
-    portalRuneCount:SetJustifyV("MIDDLE")
+    if not isRetail then
+        -- Right column: rune of portals header (icon + count)
+        local portalRuneFrame = CreateFrame("Frame", nil, portalChild)
+        portalRuneFrame:SetSize(BUTTON_SIZE, BUTTON_SIZE)
+        portalRuneFrame:SetPoint("TOPLEFT", portalChild, "TOPLEFT", 0, 0)
+        portalRuneFrame:EnableMouse(true)
+        portalRuneFrame:SetScript("OnEnter", function(self)
+            GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+            GameTooltip:SetText((TeleportalLocale and TeleportalLocale("RUNE_OF_PORTALS_TOOLTIP")) or "Rune of Portals currently\nin your bags.")
+            GameTooltip:Show()
+        end)
+        portalRuneFrame:SetScript("OnLeave", function() GameTooltip:Hide() end)
+        local portalRuneIcon = portalRuneFrame:CreateTexture(nil, "ARTWORK")
+        portalRuneIcon:SetAllPoints(portalRuneFrame)
+        portalRuneIcon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
+        portalRuneIcon:SetAlpha(0.5)
+        local portalRuneCount = portalRuneFrame:CreateFontString(nil, "OVERLAY", "NumberFontNormal")
+        portalRuneCount:SetPoint("CENTER", portalRuneFrame, "CENTER", 0, 0)
+        portalRuneCount:SetJustifyH("CENTER")
+        portalRuneCount:SetJustifyV("MIDDLE")
+        portalRuneHeader = portalRuneFrame
+        portalRuneIconRef = portalRuneIcon
+        portalRuneCountText = portalRuneCount
+    end
 
     mainPanel = panel
     teleportContent = teleportChild
     portalContent = portalChild
-    teleportRuneHeader = teleportRuneFrame
-    portalRuneHeader = portalRuneFrame
-    teleportRuneIconRef = teleportRuneIcon
-    portalRuneIconRef = portalRuneIcon
-    teleportRuneCountText = teleportRuneCount
-    portalRuneCountText = portalRuneCount
 
     return panel
 end
@@ -412,12 +559,68 @@ end
 -- Toggle button
 -- ---------------------------------------------------------------------------
 
+local function SaveToggleButtonPosition(btn)
+    local point, _, relativePoint, x, y = btn:GetPoint(1)
+    if point and type(x) == "number" and type(y) == "number" then
+        TeleportalDB.buttonPoint = point
+        TeleportalDB.buttonRelativePoint = relativePoint or point
+        TeleportalDB.buttonX = x
+        TeleportalDB.buttonY = y
+    end
+end
+
+local function ApplyToggleButtonLock()
+    if not toggleButton then return end
+    local locked = TeleportalDB.buttonLocked == true
+    toggleButton:SetMovable(not locked)
+end
+
+local function ToggleButtonLock()
+    TeleportalDB.buttonLocked = not (TeleportalDB.buttonLocked == true)
+    ApplyToggleButtonLock()
+    local cyan = "\124cFF00FFFF"
+    local r = "\124r"
+    local suffix
+    if TeleportalDB.buttonLocked then
+        suffix = (TeleportalLocale and TeleportalLocale("BUTTON_LOCKED")) or " : Button position locked."
+    else
+        suffix = (TeleportalLocale and TeleportalLocale("BUTTON_UNLOCKED")) or " : Button position unlocked."
+    end
+    DEFAULT_CHAT_FRAME:AddMessage(cyan .. "Teleportal" .. r .. suffix .. r)
+end
+
+local function ApplyToggleButtonVisibility()
+    if not toggleButton then return end
+    if TeleportalDB.toggleButtonHidden then
+        toggleButton:Hide()
+    else
+        toggleButton:Show()
+    end
+end
+
+local function ToggleToggleButtonHide()
+    TeleportalDB.toggleButtonHidden = not (TeleportalDB.toggleButtonHidden == true)
+    if TeleportalDB.toggleButtonHidden and mainPanel and mainPanel:IsShown() then
+        AnimatePanelClose()
+    end
+    ApplyToggleButtonVisibility()
+    local cyan = "\124cFF00FFFF"
+    local r = "\124r"
+    local suffix
+    if TeleportalDB.toggleButtonHidden then
+        suffix = (TeleportalLocale and TeleportalLocale("TOGGLE_BUTTON_HIDDEN")) or " : Launcher button hidden."
+    else
+        suffix = (TeleportalLocale and TeleportalLocale("TOGGLE_BUTTON_SHOWN")) or " : Launcher button shown."
+    end
+    DEFAULT_CHAT_FRAME:AddMessage(cyan .. "Teleportal" .. r .. suffix .. r)
+end
+
 local function CreateToggleButton()
     local iconPath = "Interface/AddOns/Teleportal/assets/teleportal.tga"
     local fallbackIcon = "Interface/Icons/Spell_Arcane_Teleport"
 
     local btn = CreateFrame("Button", "TeleportalToggleButton", UIParent)
-    btn:SetSize(61, 36)
+    btn:SetSize(BUTTON_SIZE, BUTTON_SIZE)
     -- Restore saved position (WoW may use TOPLEFT etc. after drag, so save full anchor)
     local db = TeleportalDB
     if type(db.buttonPoint) == "string" and type(db.buttonX) == "number" and type(db.buttonY) == "number" then
@@ -425,32 +628,27 @@ local function CreateToggleButton()
     else
         btn:SetPoint("CENTER", UIParent, "CENTER", -200, 0)
     end
-    btn:SetMovable(true)
     btn:SetClampedToScreen(true)
     btn:RegisterForDrag("LeftButton")
-    btn:SetScript("OnDragStart", function(self) self:StartMoving() end)
+    btn:SetScript("OnDragStart", function(self)
+        if TeleportalDB.buttonLocked then return end
+        self:StartMoving()
+    end)
     btn:SetScript("OnDragStop", function(self)
+        if TeleportalDB.buttonLocked then return end
         self:StopMovingOrSizing()
-        local point, _, relativePoint, x, y = self:GetPoint(1)
-        if point and type(x) == "number" and type(y) == "number" then
-            TeleportalDB.buttonPoint = point
-            TeleportalDB.buttonRelativePoint = relativePoint or point
-            TeleportalDB.buttonX = x
-            TeleportalDB.buttonY = y
-        end
+        SaveToggleButtonPosition(self)
     end)
-    btn:SetScript("OnClick", function()
-        if mainPanel:IsShown() then
-            AnimatePanelClose()
-        else
-            AnimatePanelOpen()
-        end
-    end)
+    btn:SetScript("OnClick", ToggleTeleportalPanel)
 
     -- Tooltip for main Teleportal button
     btn:SetScript("OnEnter", function(self)
         GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
-        GameTooltip:SetText("Teleportal r1.0.250226\nby Codermik.")
+        if TeleportalDB.buttonLocked then
+            GameTooltip:SetText((TeleportalLocale and TeleportalLocale("TOGGLE_BUTTON_TOOLTIP_LOCKED")) or "Teleportal (locked)\n/teleportal lock to move")
+        else
+            GameTooltip:SetText((TeleportalLocale and TeleportalLocale("TOGGLE_BUTTON_TOOLTIP")) or "Teleportal\nDrag to move, /teleportal lock to fix")
+        end
         GameTooltip:Show()
     end)
     btn:SetScript("OnLeave", function()
@@ -487,14 +685,6 @@ local function CreateToggleButton()
     tex:SetTexture(iconPath)
     tex:SetAlpha(0.55)
 
-    -- Rune counter overlay (teleport runes / portal runes) - same style as frame counters
-    local runeCountText = btn:CreateFontString(nil, "OVERLAY", "NumberFontNormal")
-    runeCountText:SetPoint("CENTER", btn, "CENTER", 0, 0)
-    runeCountText:SetJustifyH("CENTER")
-    runeCountText:SetJustifyV("MIDDLE")
-    runeCountText:SetText("0/0")
-    btn.runeCountText = runeCountText
-
     btn:SetScript("OnShow", function()
         if not tex:GetTexture() or tex:GetTexture() == "" then
             tex:SetTexture(fallbackIcon)
@@ -509,6 +699,8 @@ local function CreateToggleButton()
     highlight:SetBlendMode("ADD")
 
     toggleButton = btn
+    ApplyToggleButtonLock()
+    ApplyToggleButtonVisibility()
     return btn
 end
 
@@ -519,7 +711,7 @@ end
 local addonLoadedForMage = false
 local frame = CreateFrame("Frame")
 
-local function OnEvent(_, event, arg1)
+local function OnEvent(_, event, arg1, arg2, arg3)
     if event == "ADDON_LOADED" and arg1 == ADDON_NAME then
         -- Defer UI to PLAYER_LOGIN so we can check class
     elseif event == "PLAYER_LOGIN" then
@@ -537,10 +729,13 @@ local function OnEvent(_, event, arg1)
             local cyan = "\124cFF00FFFF"
             local yellow = "\124cFFFFFF00"
             local r = "\124r"
-            DEFAULT_CHAT_FRAME:AddMessage(cyan .. "Teleportal" .. r .. " : loaded! - Created by Codermik, join Discord for support at: " .. yellow .. "https://discord.gg/R6EkZ94TKK" .. r)
+            local tocVersion = select(4, GetBuildInfo())
+            local tocLabel = tocVersion and tostring(tocVersion) or "?"
+            DEFAULT_CHAT_FRAME:AddMessage(cyan .. "Teleportal (" .. tocLabel .. ")" .. r .. " : loaded! - Created by Codermik, join Discord for support at: " .. yellow .. "https://discord.gg/R6EkZ94TKK" .. r)
             frame:RegisterEvent("SPELLS_CHANGED")
             frame:RegisterEvent("BAG_UPDATE_DELAYED")
             frame:RegisterEvent("PLAYER_REGEN_ENABLED")
+            frame:RegisterEvent("UNIT_SPELLCAST_SUCCEEDED")
         else
             ScanAndRebuild()
         end
@@ -558,6 +753,29 @@ local function OnEvent(_, event, arg1)
             pendingSpellRebuild = false
             ScanAndRebuild()
         end
+    elseif event == "UNIT_SPELLCAST_SUCCEEDED" then
+        -- unitTarget, castGUID, spellID
+        if arg1 == "player" and arg3 and closeOnCastSpellIDs[arg3] and mainPanel and mainPanel:IsShown() then
+            AnimatePanelClose()
+        end
+    end
+end
+
+SLASH_TELEPORTAL1 = "/teleportal"
+SLASH_TELEPORTAL2 = "/tp"
+SlashCmdList["TELEPORTAL"] = function(msg)
+    msg = (msg and string.lower(msg:match("^%s*(.-)%s*$") or msg)) or ""
+    local cyan = "\124cFF00FFFF"
+    local r = "\124r"
+    if msg == "lock" then
+        ToggleButtonLock()
+    elseif msg == "hide" then
+        ToggleToggleButtonHide()
+    elseif msg == "toggle" then
+        ToggleTeleportalPanel()
+    else
+        local help = (TeleportalLocale and TeleportalLocale("SLASH_COMMAND_HELP")) or " : /teleportal toggle - open/close spells. /teleportal hide - hide launcher. /teleportal lock - lock position."
+        DEFAULT_CHAT_FRAME:AddMessage(cyan .. "Teleportal" .. r .. help .. r)
     end
 end
 
