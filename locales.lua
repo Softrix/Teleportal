@@ -1,5 +1,5 @@
 --[[
-    Teleportal - Locale strings
+    Teleportal - Locale strings and spell-name patterns
 ]]
 
 local locales = {
@@ -148,8 +148,95 @@ local locales = {
     },
 }
 
+-- Fallback spell-name patterns for discovery when spell IDs are unknown.
+-- teleport/portal: classifiers; teleDest/portalDest: destination extractors for pairing
+local spellPatterns = {
+    enUS = {
+        teleport = "^Teleport",
+        portal = "^Portal",
+        teleDest = "^Teleport:%s*(.+)$",
+        portalDest = "^Portal:%s*(.+)$",
+    },
+    deDE = {
+        teleport = "^Teleportieren",
+        portal = "^Portal",
+        teleDest = "^Teleportieren:%s*(.+)$",
+        portalDest = "^Portal:%s*(.+)$",
+    },
+    frFR = {
+        teleport = "^Téléportation",
+        portal = "^Portail",
+        teleDest = "^Téléportation%s*:%s*(.+)$",
+        portalDest = "^Portail%s*:%s*(.+)$",
+    },
+    esES = {
+        teleport = "^Teletransporte",
+        portal = "^Portal",
+        teleDest = "^Teletransporte%s+a%s+(.+)$",
+        portalDest = "^Portal:%s*(.+)$",
+    },
+    esMX = {
+        teleport = "^Teletransporte",
+        portal = "^Portal",
+        teleDest = "^Teletransporte%s+a%s+(.+)$",
+        portalDest = "^Portal:%s*(.+)$",
+    },
+    ptBR = {
+        teleport = "^Teleportar",
+        portal = "^Portal",
+        teleDest = "^Teleportar%s*:%s*(.+)$",
+        portalDest = "^Portal%s*:%s*(.+)$",
+    },
+    ptPT = {
+        teleport = "^Teleportar",
+        portal = "^Portal",
+        teleDest = "^Teleportar%s*:%s*(.+)$",
+        portalDest = "^Portal%s*:%s*(.+)$",
+    },
+    ruRU = {
+        teleport = "^Телепортация",
+        portal = "^Портал",
+        teleDest = "^Телепортация:%s*(.+)$",
+        portalDest = "^Портал:%s*(.+)$",
+    },
+    koKR = {
+        teleport = "^순간이동",
+        portal = "^차원의 문",
+        teleDest = "^순간이동:%s*(.+)$",
+        portalDest = "^차원의 문:%s*(.+)$",
+    },
+    zhCN = {
+        teleport = "^传送：",
+        portal = "^传送门：",
+        teleDest = "^传送：%s*(.+)$",
+        portalDest = "^传送门：%s*(.+)$",
+    },
+    zhTW = {
+        teleport = "^傳送：",
+        portal = "^傳送門：",
+        teleDest = "^傳送：%s*(.+)$",
+        portalDest = "^傳送門：%s*(.+)$",
+    },
+    jaJP = {
+        teleport = "^テレポート：",
+        portal = "^ポータル：",
+        teleDest = "^テレポート：%s*(.+)$",
+        portalDest = "^ポータル：%s*(.+)$",
+    },
+    itIT = {
+        teleport = "^Teletrasporto",
+        portal = "^Portale",
+        teleDest = "^Teletrasporto%s+a%s+(.+)$",
+        portalDest = "^Portale:%s*(.+)$",
+    },
+}
+
 -- Fallback to enUS if locale missing; expose for addon use
 function TeleportalLocale(key)
     local locale = locales[GetLocale()] or locales.enUS
     return locale[key] or locales.enUS[key] or ""
+end
+
+function TeleportalSpellPatterns()
+    return spellPatterns[GetLocale()] or spellPatterns.enUS
 end

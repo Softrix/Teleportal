@@ -5,7 +5,7 @@
 ]]
 
 local ADDON_NAME = "Teleportal"
-local ADDON_VERSION = "1.0.240526"
+local ADDON_VERSION = "1.1.130726"
 local BOOKTYPE = (BOOKTYPE_SPELL ~= nil) and BOOKTYPE_SPELL or "spell"
 local isRetail = (WOW_PROJECT_MAINLINE and WOW_PROJECT_ID == WOW_PROJECT_MAINLINE)
 
@@ -14,9 +14,55 @@ if not TeleportalDB then
     TeleportalDB = {}
 end
 
--- Spell lists: { name = spellName, spellID = spellID }
-local teleportSpells = {}
-local portalSpells = {}
+-- Paired rows: { teleport = spellInfo|nil, portal = spellInfo|nil }
+-- spellInfo = { name = localizedName, spellID = id }
+local spellRows = {}
+
+-- Rune reagent item IDs (mage)
+local RUNE_TELEPORT_ITEM_ID = 17031
+local RUNE_PORTAL_ITEM_ID = 17032
+
+-- { teleportID, portalID } — portalID may be nil for teleport-only spells
+local TELEPORT_PORTAL_PAIRS = {
+    -- Classic / Era / Anniversary
+    { 3561, 10059 },   -- Stormwind
+    { 3562, 11416 },   -- Ironforge
+    { 3565, 11419 },   -- Darnassus
+    { 3567, 11417 },   -- Orgrimmar
+    { 3563, 11418 },   -- Undercity
+    { 3566, 11420 },   -- Thunder Bluff
+    -- TBC
+    { 32271, 32266 },  -- Exodar
+    { 32272, 32267 },  -- Silvermoon
+    { 33690, 33691 },  -- Shattrath (Alliance)
+    { 35715, 35717 },  -- Shattrath (Horde)
+    -- Wrath
+    { 49359, 49360 },  -- Theramore
+    { 49358, 49361 },  -- Stonard
+    { 53140, 53142 },  -- Dalaran (Northrend)
+    -- Cataclysm
+    { 88342, 88345 },  -- Tol Barad (Alliance)
+    { 88344, 88346 },  -- Tol Barad (Horde)
+    -- MoP
+    { 132621, 132620 }, -- Vale of Eternal Blossoms (Alliance)
+    { 132627, 132626 }, -- Vale of Eternal Blossoms (Horde)
+    -- WoD
+    { 176248, 176246 }, -- Stormshield
+    { 176242, 176244 }, -- Warspear
+    -- Legion
+    { 224869, 224871 }, -- Dalaran (Broken Isles)
+    { 120145, 120146 }, -- Ancient Teleport/Portal: Dalaran
+    { 193759, nil },    -- Hall of the Guardian
+    -- BfA
+    { 281403, 281400 }, -- Boralus
+    { 281404, 281402 }, -- Dazar'alor
+    -- Shadowlands
+    { 344587, 344597 }, -- Oribos
+    -- Dragonflight
+    { 395277, 395289 }, -- Valdrakken
+    -- The War Within
+    { 446540, 446534 }, -- Dornogal
+}
 
 -- Rune reagent item IDs (mage)
 local RUNE_TELEPORT_ITEM_ID = 17031
@@ -62,8 +108,7 @@ end
 
 local function UpdatePanelHeight()
     if not mainPanel or not teleportContent then return end
-    -- One row per teleport (portal column shows matching portal or blank)
-    local rowCount = #teleportSpells
+    local rowCount = #spellRows
     local contentHeight = GetContentHeightForButtonCount(rowCount)
     local panelHeight = PANEL_TOP_INSET + contentHeight + PANEL_BOTTOM_INSET
     mainPanel:SetHeight(panelHeight)
@@ -72,15 +117,93 @@ local function UpdatePanelHeight()
 end
 
 -- ---------------------------------------------------------------------------
--- Spellbook scan
+-- Spell discovery (spell IDs + localized name fallback)
 -- ---------------------------------------------------------------------------
 
-local function ScanSpellbook()
-    teleportSpells = {}
-    portalSpells = {}
+local function PlayerKnowsSpell(spellID)
+    if not spellID then return false end
+    if C_SpellBook and C_SpellBook.IsSpellInSpellBook then
+        local ok, result = pcall(C_SpellBook.IsSpellInSpellBook, spellID)
+        if ok and result then return true end
+    end
+    if IsPlayerSpell and IsPlayerSpell(spellID) then
+        return true
+    end
+    if IsSpellKnownOrOverridesKnown and IsSpellKnownOrOverridesKnown(spellID) then
+        return true
+    end
+    if IsSpellKnown and IsSpellKnown(spellID) then
+        return true
+    end
+    return false
+end
+
+local function GetSpellNameByID(spellID)
+    if not spellID then return nil end
+    if C_Spell and C_Spell.GetSpellName then
+        return C_Spell.GetSpellName(spellID)
+    end
+    local name = GetSpellInfo(spellID)
+    return name
+end
+
+local function MakeSpellInfo(spellID)
+    if not spellID then return nil end
+    local name = GetSpellNameByID(spellID)
+    if not name or name == "" then return nil end
+    return { name = name, spellID = spellID }
+end
+
+local function GetLocaleSpellPatterns()
+    if TeleportalSpellPatterns then
+        return TeleportalSpellPatterns()
+    end
+    return nil
+end
+
+local function ClassifySpellName(name, patterns)
+    if not name or not patterns then return nil end
+    -- Check portal before teleport so locale prefixes that share a root still classify correctly
+    if patterns.portal and name:match(patterns.portal) then
+        return "portal"
+    end
+    if patterns.teleport and name:match(patterns.teleport) then
+        return "teleport"
+    end
+    return nil
+end
+
+local function GetDestination(spellName, kind)
+    if not spellName then return nil end
+    local patterns = GetLocaleSpellPatterns()
+    if kind == "portal" then
+        return spellName:match(patterns.portalDest)
+    end
+    if kind == "teleport" then
+        return spellName:match(patterns.teleDest)
+    end
+    return spellName:match(patterns.teleDest) or spellName:match(patterns.portalDest)
+end
+
+local function ScanSpellbookByLocalizedNames(seenIDs)
+    local patterns = GetLocaleSpellPatterns()
+    local foundTeleports = {}
+    local foundPortals = {}
+
+    local function consider(name, spellID)
+        if not name or not spellID or seenIDs[spellID] then return end
+        if C_Spell and C_Spell.IsSpellPassive and C_Spell.IsSpellPassive(spellID) then return end
+        local kind = ClassifySpellName(name, patterns)
+        if kind == "teleport" then
+            tinsert(foundTeleports, { name = name, spellID = spellID })
+            seenIDs[spellID] = true
+        elseif kind == "portal" then
+            tinsert(foundPortals, { name = name, spellID = spellID })
+            seenIDs[spellID] = true
+        end
+    end
 
     if isRetail and C_SpellBook and C_SpellBook.GetSpellBookItemInfo then
-        -- Retail (11.0+): spellbook uses C_SpellBook; Teleport/Portal may be under Flyout items
         local spellBank = Enum and Enum.SpellBookSpellBank and Enum.SpellBookSpellBank.Player or 0
         local spellType = Enum and Enum.SpellBookItemType and Enum.SpellBookItemType.Spell or 1
         local flyoutType = Enum and Enum.SpellBookItemType and Enum.SpellBookItemType.Flyout or 4
@@ -93,30 +216,15 @@ local function ScanSpellbook()
                     local info = C_SpellBook.GetSpellBookItemInfo(j, spellBank)
                     if not info then break end
                     if info.itemType == spellType and info.name and not info.isPassive then
-                        local spellID = info.spellID or info.actionID
-                        if spellID then
-                            if info.name:match("^Teleport") then
-                                tinsert(teleportSpells, { name = info.name, spellID = spellID })
-                            elseif info.name:match("^Portal") then
-                                tinsert(portalSpells, { name = info.name, spellID = spellID })
-                            end
-                        end
+                        consider(info.name, info.spellID or info.actionID)
                     elseif info.itemType == flyoutType and info.actionID and GetFlyoutInfo and GetFlyoutSlotInfo then
-                        -- Teleport/Portal are often in a flyout; expand it and add matching spells
                         local flyoutID = info.actionID
                         local _, _, flyoutNumSlots = GetFlyoutInfo(flyoutID)
                         if flyoutNumSlots and flyoutNumSlots > 0 then
                             for slot = 1, flyoutNumSlots do
                                 local slotSpellID, overrideSpellID, isKnown, spellName = GetFlyoutSlotInfo(flyoutID, slot)
                                 if isKnown and spellName and (slotSpellID or overrideSpellID) then
-                                    local id = overrideSpellID or slotSpellID
-                                    if C_Spell and C_Spell.IsSpellPassive and C_Spell.IsSpellPassive(id) then
-                                        -- skip passive (e.g. Teleportation Nexus)
-                                    elseif spellName:match("^Teleport") then
-                                        tinsert(teleportSpells, { name = spellName, spellID = id })
-                                    elseif spellName:match("^Portal") then
-                                        tinsert(portalSpells, { name = spellName, spellID = id })
-                                    end
+                                    consider(spellName, overrideSpellID or slotSpellID)
                                 end
                             end
                         end
@@ -124,43 +232,74 @@ local function ScanSpellbook()
                 end
             end
         end
-        return
-    end
-
-    -- Classic: use GetSpellBookItemName / GetSpellBookItemInfo
-    local i = 1
-    while true do
-        local name = GetSpellBookItemName(i, BOOKTYPE)
-        if not name then
-            break
-        end
-
-        local skillType, spellID = GetSpellBookItemInfo(i, BOOKTYPE)
-        if skillType == "SPELL" and spellID then
-            local passive = (IsPassiveSpell and IsPassiveSpell(i, BOOKTYPE))
-            if not passive then
-                if name:match("^Teleport") then
-                    tinsert(teleportSpells, { name = name, spellID = spellID })
-                elseif name:match("^Portal") then
-                    tinsert(portalSpells, { name = name, spellID = spellID })
+    else
+        local i = 1
+        while true do
+            local name = GetSpellBookItemName(i, BOOKTYPE)
+            if not name then break end
+            local skillType, spellID = GetSpellBookItemInfo(i, BOOKTYPE)
+            if skillType == "SPELL" and spellID then
+                local passive = (IsPassiveSpell and IsPassiveSpell(i, BOOKTYPE))
+                if not passive then
+                    consider(name, spellID)
                 end
             end
+            i = i + 1
         end
-
-        i = i + 1
     end
+
+    -- Pair leftover teleports/portals by localized destination
+    local portalByDest = {}
+    for _, portalInfo in ipairs(foundPortals) do
+        local dest = GetDestination(portalInfo.name, "portal")
+        if dest and not portalByDest[dest] then
+            portalByDest[dest] = portalInfo
+        end
+    end
+
+    local usedPortals = {}
+    for _, teleInfo in ipairs(foundTeleports) do
+        local dest = GetDestination(teleInfo.name, "teleport")
+        local portalInfo = dest and portalByDest[dest] or nil
+        if portalInfo then
+            usedPortals[portalInfo.spellID] = true
+        end
+        tinsert(spellRows, { teleport = teleInfo, portal = portalInfo })
+    end
+
+    for _, portalInfo in ipairs(foundPortals) do
+        if not usedPortals[portalInfo.spellID] then
+            tinsert(spellRows, { teleport = nil, portal = portalInfo })
+        end
+    end
+end
+
+local function ScanSpellbook()
+    spellRows = {}
+    local seenIDs = {}
+
+    for _, pair in ipairs(TELEPORT_PORTAL_PAIRS) do
+        local teleID, portalID = pair[1], pair[2]
+        local teleKnown = PlayerKnowsSpell(teleID)
+        local portalKnown = portalID and PlayerKnowsSpell(portalID)
+        if teleKnown or portalKnown then
+            local teleInfo = teleKnown and MakeSpellInfo(teleID) or nil
+            local portalInfo = portalKnown and MakeSpellInfo(portalID) or nil
+            if teleInfo or portalInfo then
+                tinsert(spellRows, { teleport = teleInfo, portal = portalInfo })
+                if teleInfo then seenIDs[teleID] = true end
+                if portalInfo and portalID then seenIDs[portalID] = true end
+            end
+        end
+    end
+
+    -- Catch any mage teleports/portals missing from the ID table (localized names)
+    ScanSpellbookByLocalizedNames(seenIDs)
 end
 
 -- ---------------------------------------------------------------------------
 -- Rebuild spell buttons in both columns
 -- ---------------------------------------------------------------------------
-
--- Extract destination from "Teleport: X" or "Portal: X" for matching pairs
-local function GetDestination(spellName)
-    if not spellName then return nil end
-    local dest = spellName:match("^Teleport: (.+)") or spellName:match("^Portal: (.+)")
-    return dest
-end
 
 local function GetOrCreateSpellButton(parent, pool, spellInfo, index)
     local btn = tremove(pool)
@@ -200,7 +339,8 @@ local function GetOrCreateSpellButton(parent, pool, spellInfo, index)
     local rowOffset = isRetail and (index - 1) or index
     btn:SetPoint("TOPLEFT", parent, "TOPLEFT", 0, -rowOffset * (BUTTON_SIZE + BUTTON_PADDING))
     btn:SetAttribute("type", "spell")
-    btn:SetAttribute("spell", spellInfo.name)
+    -- Prefer spell ID so casting works regardless of client language
+    btn:SetAttribute("spell", spellInfo.spellID or spellInfo.name)
     local tex
     if isRetail and C_Spell and C_Spell.GetSpellTexture then
         tex = C_Spell.GetSpellTexture(spellInfo.spellID)
@@ -239,17 +379,7 @@ local function RebuildSpellLists()
         return
     end
 
-    -- Index portals by destination so we can match "Teleport: X" with "Portal: X"
-    local portalByDestination = {}
-    for _, spellInfo in ipairs(portalSpells) do
-        local dest = GetDestination(spellInfo.name)
-        if dest then
-            portalByDestination[dest] = spellInfo
-        end
-    end
-
-    -- One row per teleport; each row shows (teleport, matching portal or blank)
-    local rowCount = #teleportSpells
+    local rowCount = #spellRows
 
     -- Return current buttons to spell pools and placeholders to blank pools
     for _, b in ipairs(teleportButtons) do
@@ -277,32 +407,30 @@ local function RebuildSpellLists()
     end
     portalPlaceholders = {}
 
+    closeOnCastSpellIDs = {}
+
     for row = 1, rowCount do
-        local teleInfo = teleportSpells[row]
-        local dest = GetDestination(teleInfo.name)
-        local portalInfo = dest and portalByDestination[dest] or nil
+        local rowInfo = spellRows[row]
+        local teleInfo = rowInfo.teleport
+        local portalInfo = rowInfo.portal
 
-        -- Left column: always the teleport for this row
-        local btn = GetOrCreateSpellButton(teleportContent, teleportButtonPool, teleInfo, row)
-        tinsert(teleportButtons, btn)
+        if teleInfo then
+            local btn = GetOrCreateSpellButton(teleportContent, teleportButtonPool, teleInfo, row)
+            tinsert(teleportButtons, btn)
+            if teleInfo.spellID then closeOnCastSpellIDs[teleInfo.spellID] = true end
+        else
+            local ph = GetOrCreateBlankPlaceholder(teleportContent, teleportBlankPool, row)
+            tinsert(teleportPlaceholders, ph)
+        end
 
-        -- Right column: matching portal if one exists for this destination, else blank
         if portalInfo then
             local pbtn = GetOrCreateSpellButton(portalContent, portalButtonPool, portalInfo, row)
             tinsert(portalButtons, pbtn)
+            if portalInfo.spellID then closeOnCastSpellIDs[portalInfo.spellID] = true end
         else
             local ph = GetOrCreateBlankPlaceholder(portalContent, portalBlankPool, row)
             tinsert(portalPlaceholders, ph)
         end
-    end
-
-    -- Build set of spell IDs that trigger auto-close when cast finishes
-    closeOnCastSpellIDs = {}
-    for _, info in ipairs(teleportSpells) do
-        if info.spellID then closeOnCastSpellIDs[info.spellID] = true end
-    end
-    for _, info in ipairs(portalSpells) do
-        if info.spellID then closeOnCastSpellIDs[info.spellID] = true end
     end
 
     UpdatePanelHeight()
