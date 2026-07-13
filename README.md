@@ -130,8 +130,10 @@ When the panel is open:
 /teleportal toggle       Open / close spell panel
 /teleportal hide         Show / hide launcher button
 /teleportal lock         Lock / unlock launcher position
+/teleportal reset        Reset the addon, i.e. button positions etc.
 
 /tp toggle               Same as /teleportal toggle
 /tp hide                 Same as /teleportal hide
 /tp lock                 Same as /teleportal lock
+/tp reset                Same as /teleportal reset
 ```

@@ -5,9 +5,13 @@
 ]]
 
 local ADDON_NAME = "Teleportal"
-local ADDON_VERSION = "1.1.130726"
+local ADDON_VERSION = "1.2.130726"
 local BOOKTYPE = (BOOKTYPE_SPELL ~= nil) and BOOKTYPE_SPELL or "spell"
 local isRetail = (WOW_PROJECT_MAINLINE and WOW_PROJECT_ID == WOW_PROJECT_MAINLINE)
+-- Rune reagents were removed in MoP (retail and MoP Classic); still required Era–Cata.
+local showRuneReagents = not isRetail
+    and not (WOW_PROJECT_MISTS_CLASSIC and WOW_PROJECT_ID == WOW_PROJECT_MISTS_CLASSIC)
+    and (select(4, GetBuildInfo()) or 0) < 50500
 
 -- Saved position for toggle button (persists across sessions)
 if not TeleportalDB then
@@ -100,9 +104,9 @@ local COLUMN_GAP = 1
 local PANEL_TOP_INSET = 1
 local PANEL_BOTTOM_INSET = 1
 
--- Content height = one header row + N spell rows (Classic); N spell rows only (Retail)
+-- Content height = one header row + N spell rows (reagents); N spell rows only when reagents unused
 local function GetContentHeightForButtonCount(count)
-    local rows = isRetail and count or (1 + count)
+    local rows = showRuneReagents and (1 + count) or count
     return math.max(0, rows * (BUTTON_SIZE + BUTTON_PADDING) - BUTTON_PADDING)
 end
 
@@ -298,6 +302,89 @@ local function ScanSpellbook()
 end
 
 -- ---------------------------------------------------------------------------
+-- Hover sparkle (AutoCastShine when available, otherwise orbiting stars)
+-- ---------------------------------------------------------------------------
+
+local SPARKLE_TEXTURE = "Interface\\Cooldown\\star4"
+local SPARKLE_COUNT = 4
+local SPARKLE_RADIUS = (BUTTON_SIZE / 2) + 2
+local SPARKLE_SPEED = 3.5
+
+local function PlayButtonHoverSound()
+    if SOUNDKIT and SOUNDKIT.IG_MAINMENU_OPTION_CHECKBOX_ON then
+        PlaySound(SOUNDKIT.IG_MAINMENU_OPTION_CHECKBOX_ON)
+    else
+        PlaySound("igMainMenuOptionCheckBoxOn")
+    end
+end
+
+local function StopButtonSparkle(btn)
+    if not btn then return end
+    local shine = btn.sparkleFrame
+    if not shine then return end
+    if AutoCastShine_AutoCastStop and shine.isAutoCast then
+        AutoCastShine_AutoCastStop(shine)
+    end
+    shine:SetScript("OnUpdate", nil)
+    shine:Hide()
+end
+
+local function StartButtonSparkle(btn)
+    if not btn or not btn.sparkleFrame then return end
+    local shine = btn.sparkleFrame
+    shine:Show()
+    if shine.isAutoCast and AutoCastShine_AutoCastStart then
+        -- Cyan sparkles to match Teleportal branding
+        AutoCastShine_AutoCastStart(shine, 0.3, 0.9, 1)
+        return
+    end
+    shine.elapsed = 0
+    shine:SetScript("OnUpdate", function(self, elapsed)
+        self.elapsed = (self.elapsed or 0) + elapsed
+        local angle = self.elapsed * SPARKLE_SPEED
+        for i, tex in ipairs(self.sparkles) do
+            local a = angle + (i - 1) * (math.pi * 2 / SPARKLE_COUNT)
+            tex:ClearAllPoints()
+            tex:SetPoint("CENTER", self, "CENTER", math.cos(a) * SPARKLE_RADIUS, math.sin(a) * SPARKLE_RADIUS)
+            local pulse = 0.55 + 0.45 * math.abs(math.sin(self.elapsed * 7 + i))
+            tex:SetAlpha(pulse)
+            local size = 7 + 5 * pulse
+            tex:SetSize(size, size)
+        end
+    end)
+end
+
+local function CreateButtonSparkleFrame(btn)
+    -- Prefer Blizzard's auto-cast sparkles when the template exists
+    if AutoCastShine_AutoCastStart then
+        local ok, shine = pcall(CreateFrame, "Frame", nil, btn, "AutoCastShineTemplate")
+        if ok and shine then
+            shine:SetAllPoints(btn)
+            shine:SetFrameLevel(btn:GetFrameLevel() + 5)
+            shine.isAutoCast = true
+            shine:Hide()
+            btn.sparkleFrame = shine
+            return
+        end
+    end
+
+    local shine = CreateFrame("Frame", nil, btn)
+    shine:SetAllPoints(btn)
+    shine:SetFrameLevel(btn:GetFrameLevel() + 5)
+    shine.sparkles = {}
+    for i = 1, SPARKLE_COUNT do
+        local tex = shine:CreateTexture(nil, "OVERLAY")
+        tex:SetTexture(SPARKLE_TEXTURE)
+        tex:SetBlendMode("ADD")
+        tex:SetSize(10, 10)
+        tex:SetVertexColor(0.35, 0.9, 1)
+        shine.sparkles[i] = tex
+    end
+    shine:Hide()
+    btn.sparkleFrame = shine
+end
+
+-- ---------------------------------------------------------------------------
 -- Rebuild spell buttons in both columns
 -- ---------------------------------------------------------------------------
 
@@ -318,7 +405,11 @@ local function GetOrCreateSpellButton(parent, pool, spellInfo, index)
         highlight:SetTexture("Interface\\Buttons\\ButtonHilight-Square")
         highlight:SetBlendMode("ADD")
         highlight:SetAlpha(0.5)
+        CreateButtonSparkleFrame(btn)
         btn:SetScript("OnEnter", function(self)
+            self:SetFrameLevel((self:GetParent() and self:GetParent():GetFrameLevel() or 0) + 20)
+            PlayButtonHoverSound()
+            StartButtonSparkle(self)
             GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
             if GameTooltip.SetSpellByID then
                 GameTooltip:SetSpellByID(self.spellID)
@@ -327,16 +418,21 @@ local function GetOrCreateSpellButton(parent, pool, spellInfo, index)
             end
             GameTooltip:Show()
         end)
-        btn:SetScript("OnLeave", function()
+        btn:SetScript("OnLeave", function(self)
+            self:SetFrameLevel((self:GetParent() and self:GetParent():GetFrameLevel() or 0) + 10)
+            StopButtonSparkle(self)
             GameTooltip:Hide()
+        end)
+        btn:SetScript("OnHide", function(self)
+            StopButtonSparkle(self)
         end)
     end
     btn.spellID = spellInfo.spellID
     btn.spellName = spellInfo.name
     btn:SetParent(parent)
     btn:ClearAllPoints()
-    -- Classic: first spell below header (index 1 at -1 row). Retail: first spell at top (index 1 at 0).
-    local rowOffset = isRetail and (index - 1) or index
+    -- With reagents: first spell below header (index 1 at row 1). Otherwise first spell at top (index 1 at 0).
+    local rowOffset = showRuneReagents and index or (index - 1)
     btn:SetPoint("TOPLEFT", parent, "TOPLEFT", 0, -rowOffset * (BUTTON_SIZE + BUTTON_PADDING))
     btn:SetAttribute("type", "spell")
     -- Prefer spell ID so casting works regardless of client language
@@ -350,6 +446,7 @@ local function GetOrCreateSpellButton(parent, pool, spellInfo, index)
     if tex then
         btn.icon:SetTexture(tex)
     end
+    StopButtonSparkle(btn)
     btn:Show()
     return btn
 end
@@ -364,7 +461,7 @@ local function GetOrCreateBlankPlaceholder(parent, pool, index)
     end
     ph:SetParent(parent)
     ph:ClearAllPoints()
-    local rowOffset = isRetail and (index - 1) or index
+    local rowOffset = showRuneReagents and index or (index - 1)
     ph:SetPoint("TOPLEFT", parent, "TOPLEFT", 0, -rowOffset * (BUTTON_SIZE + BUTTON_PADDING))
     ph:Show()
     return ph
@@ -510,7 +607,7 @@ local PANEL_ABOVE_BUTTON_OFFSET = 28
 local PANEL_BOTTOM_OFFSET = (BUTTON_SIZE / 2) + PANEL_ABOVE_BUTTON_OFFSET
 
 local function UpdateRuneHeader()
-    if isRetail then return end
+    if not showRuneReagents then return end
     local teleCount = GetItemCount(RUNE_TELEPORT_ITEM_ID) or 0
     local portalCount = GetItemCount(RUNE_PORTAL_ITEM_ID) or 0
     if teleportRuneCountText and portalRuneCountText then
@@ -620,7 +717,7 @@ local function CreateMainPanel()
     teleportChild:SetFrameLevel(panel:GetFrameLevel() + 10)
     teleportChild:EnableMouse(false)
 
-    if not isRetail then
+    if showRuneReagents then
         -- Left column: rune of teleportation header (icon + count)
         local teleportRuneFrame = CreateFrame("Frame", nil, teleportChild)
         teleportRuneFrame:SetSize(BUTTON_SIZE, BUTTON_SIZE)
@@ -651,7 +748,7 @@ local function CreateMainPanel()
     portalChild:SetFrameLevel(panel:GetFrameLevel() + 10)
     portalChild:EnableMouse(false)
 
-    if not isRetail then
+    if showRuneReagents then
         -- Right column: rune of portals header (icon + count)
         local portalRuneFrame = CreateFrame("Frame", nil, portalChild)
         portalRuneFrame:SetSize(BUTTON_SIZE, BUTTON_SIZE)
@@ -741,6 +838,29 @@ local function ToggleToggleButtonHide()
         suffix = (TeleportalLocale and TeleportalLocale("TOGGLE_BUTTON_SHOWN")) or " : Launcher button shown."
     end
     DEFAULT_CHAT_FRAME:AddMessage(cyan .. "Teleportal" .. r .. suffix .. r)
+end
+
+local function ResetTeleportalSettings()
+    TeleportalDB.buttonPoint = nil
+    TeleportalDB.buttonRelativePoint = nil
+    TeleportalDB.buttonX = nil
+    TeleportalDB.buttonY = nil
+    TeleportalDB.buttonLocked = nil
+    TeleportalDB.toggleButtonHidden = nil
+    if toggleButton then
+        toggleButton:ClearAllPoints()
+        toggleButton:SetPoint("CENTER", UIParent, "CENTER", -200, 0)
+        ApplyToggleButtonLock()
+        ApplyToggleButtonVisibility()
+    end
+    if mainPanel and mainPanel:IsShown() then
+        AnimatePanelClose()
+    end
+    local cyan = "\124cFF00FFFF"
+    local r = "\124r"
+    local msg = (TeleportalLocale and TeleportalLocale("SETTINGS_RESET"))
+        or " : Settings reset. Launcher button restored to default position."
+    DEFAULT_CHAT_FRAME:AddMessage(cyan .. "Teleportal" .. r .. msg .. r)
 end
 
 local function CreateToggleButton()
@@ -833,6 +953,53 @@ local function CreateToggleButton()
 end
 
 -- ---------------------------------------------------------------------------
+-- Character macro: create once if missing
+-- ---------------------------------------------------------------------------
+
+local MACRO_NAME = "TP"
+local MACRO_ICON = "Achievement_Zone_Duskwood"
+local MACRO_BODY = "#showtooltip\n/teleportal toggle"
+local MACRO_CHAR_SLOT_MAX = 18
+local pendingMacroEnsure = false
+
+local function EnsureTeleportalMacro()
+    if GetMacroIndexByName(MACRO_NAME) ~= 0 then
+        return false
+    end
+    if InCombatLockdown() then
+        pendingMacroEnsure = true
+        return false
+    end
+    pendingMacroEnsure = false
+    local _, numChar = GetNumMacros()
+    if numChar >= MACRO_CHAR_SLOT_MAX then
+        return false
+    end
+    local ok = pcall(CreateMacro, MACRO_NAME, MACRO_ICON, MACRO_BODY, 1)
+    return ok and GetMacroIndexByName(MACRO_NAME) ~= 0
+end
+
+local function NotifyMacroCreated()
+    local cyan = "\124cFF00FFFF"
+    local r = "\124r"
+    local msg = (TeleportalLocale and TeleportalLocale("MACRO_CREATED"))
+        or " :  A macro has been created called TP so that you can add it to your UI if this is preferred.  Use /teleportal hide to remove the original button once dragged into position."
+    DEFAULT_CHAT_FRAME:AddMessage(cyan .. "Teleportal" .. r .. msg .. r)
+end
+
+-- Macros have no native custom tooltip text; override action-bar tooltip for TP.
+hooksecurefunc(GameTooltip, "SetAction", function(self, slot)
+    if not slot then return end
+    local actionType, id = GetActionInfo(slot)
+    if actionType ~= "macro" or not id then return end
+    local name = GetMacroInfo(id)
+    if name ~= MACRO_NAME then return end
+    self:ClearLines()
+    self:SetText((TeleportalLocale and TeleportalLocale("MACRO_TOOLTIP")) or "Launch the teleportal frame.")
+    self:Show()
+end)
+
+-- ---------------------------------------------------------------------------
 -- Events and init
 -- ---------------------------------------------------------------------------
 
@@ -856,10 +1023,18 @@ local function OnEvent(_, event, arg1, arg2, arg3)
             UpdateRuneHeader()
             local cyan = "\124cFF00FFFF"
             local yellow = "\124cFFFFFF00"
+            local blue = "\124cFF0000FF"
+            local green = "\124cFF00FF00"
+            local white = "\124cFFFFFFFF"
             local r = "\124r"
             local tocVersion = select(4, GetBuildInfo())
             local tocLabel = tocVersion and tostring(tocVersion) or "?"
-            DEFAULT_CHAT_FRAME:AddMessage(cyan .. "Teleportal (" .. tocLabel .. ")" .. r .. " : loaded! - Created by Codermik, join Discord for support at: " .. yellow .. "https://discord.gg/R6EkZ94TKK" .. r)
+            local loadedMsg = (TeleportalLocale and TeleportalLocale("ADDON_LOADED"))
+                or " : loaded! - Created by Codermik, join Discord for support at: "
+            DEFAULT_CHAT_FRAME:AddMessage(cyan .. "Teleportal " ..white.. ADDON_VERSION .. " (" .. tocLabel .. ")" .. loadedMsg .. yellow .. "https://discord.gg/R6EkZ94TKK" .. r)
+            if EnsureTeleportalMacro() then
+                NotifyMacroCreated()
+            end
             frame:RegisterEvent("SPELLS_CHANGED")
             frame:RegisterEvent("BAG_UPDATE_DELAYED")
             frame:RegisterEvent("PLAYER_REGEN_ENABLED")
@@ -881,6 +1056,11 @@ local function OnEvent(_, event, arg1, arg2, arg3)
             pendingSpellRebuild = false
             ScanAndRebuild()
         end
+        if pendingMacroEnsure then
+            if EnsureTeleportalMacro() then
+                NotifyMacroCreated()
+            end
+        end
     elseif event == "UNIT_SPELLCAST_SUCCEEDED" then
         -- unitTarget, castGUID, spellID
         if arg1 == "player" and arg3 and closeOnCastSpellIDs[arg3] and mainPanel and mainPanel:IsShown() then
@@ -901,8 +1081,11 @@ SlashCmdList["TELEPORTAL"] = function(msg)
         ToggleToggleButtonHide()
     elseif msg == "toggle" then
         ToggleTeleportalPanel()
+    elseif msg == "reset" then
+        ResetTeleportalSettings()
     else
-        local help = (TeleportalLocale and TeleportalLocale("SLASH_COMMAND_HELP")) or " : /teleportal toggle - open/close spells. /teleportal hide - hide launcher. /teleportal lock - lock position."
+        local help = (TeleportalLocale and TeleportalLocale("SLASH_COMMAND_HELP"))
+            or " : /teleportal toggle - open/close spells. /teleportal hide - hide launcher. /teleportal lock - lock position. /teleportal reset - reset settings."
         DEFAULT_CHAT_FRAME:AddMessage(cyan .. "Teleportal" .. r .. help .. r)
     end
 end

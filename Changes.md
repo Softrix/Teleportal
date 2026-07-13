@@ -1,10 +1,9 @@
 ## Changes
 
-- Added `/teleportal hide` (and `/tp hide`) to hide or show the launcher button (for macro use)
-- Added `/teleportal toggle` (and `/tp toggle`) to open or close the spell panel from a macro
-- Added `/teleportal lock` (and `/tp lock`) to lock or unlock the toggle button position
-- Added retail support
-- Under retail ignore passive teleports
-- Where portals do not exist and only teleports, we draw a blank button so everything still aligns.
-- Menu now closes when a portal or teleport is cast.
+13th July 2026
+
+- Fixed some locales issues causing non-english clients to not show portals etc.
+- Added animation around button you are currently hovering over.
+- Added blip sound as you hover over.
+- TP macro is now automatically created for convenience and can be dragged to UI - use /teleportal hide once you drag the main icon into position if using the macro button.  Note that it must be called TP otherwise the addon will create another, but you can change the icon used.
 
